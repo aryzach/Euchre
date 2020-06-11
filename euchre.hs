@@ -4,6 +4,7 @@ import Shuffle
 import Text.Read
 import qualified Data.Map as M
 import qualified Data.Set as S
+import qualified Data.List as L
 import GameTypes
 
 --game constants
@@ -49,14 +50,16 @@ runGame s = if gameWinCondition s then
 
 playHand :: State -> IO () 
 playHand s = 
- if handWinCondition s then declareHandOver s >>= runGame 
- else 
-  dealCards (changeDealerS s) >>=
-  decideTrump >>= 
-  playTrick >>
-  print "got here"
---  updateHandFromTrick (and also update players' cards,and dealer,and handscore) >>=
---  playHand
+ dealCards (changeDealerS s) >>=
+ decideTrump >>= 
+ playTricks 
+
+playTricks :: State -> IO () 
+playTricks s = 
+ if handWinCondition s then runGame $ declareHandOver (getHandS s) s
+ else
+  playTrick s >>= playTricks
+
 
 gameWinCondition :: State -> Bool
 gameWinCondition s = any (>= 10) $ M.elems $ getGameScoreS s
@@ -75,7 +78,7 @@ decideTrump s =
  let dealer = getDealerS s
  in putStr "faced up card is " >>
  print (getFaceUpS s) >> 
- askAll (nextP dealer) (getHandS s) False >>= 
+ askAll (nextP (getPlayersS s) dealer) (getHandS s) False >>= 
  \h -> let newState = updateStateH s h
  in return newState 
  where askAll :: Player -> Hand -> Bool -> IO Hand 
@@ -83,32 +86,32 @@ decideTrump s =
        askAll p (StartOfHand d f) False = 
         if p == d 
         then promptPlayer p "'order up' or 'pass'" >>= 
-             \str -> let (p',h) = handleSetTrump p d f str
+             \str -> let (p',h) = handleSetTrump (getPlayersS s) p d f str
                      in askAll p' h True 
         else promptPlayer p "'order up' or 'pass'" >>= 
-             \str -> let (p',h) = handleSetTrump p d f str
+             \str -> let (p',h) = handleSetTrump (getPlayersS s) p d f str
                      in askAll p' h False 
        askAll p (StartOfHand d f) True  = 
         if p == d
         then promptPlayer p "screw the dealer, pick a suit" >>= 
-             \str -> let (p',h) = handleSetTrump p d Nothing str
+             \str -> let (p',h) = handleSetTrump (getPlayersS s) p d Nothing str
                      in askAll p' h True 
         else promptPlayer p "call suit or 'pass'" >>= 
-             \str -> let (p',h) = handleSetTrump p d Nothing str
+             \str -> let (p',h) = handleSetTrump (getPlayersS s) p d Nothing str
                      in askAll p' h True 
        askAll _ h _ = return h
  
-handleSetTrump :: Player -> Player -> FaceUp -> String -> (Player,Hand)
-handleSetTrump p d (Just (C s v)) str = 
+handleSetTrump :: Players -> Player -> Player -> FaceUp -> String -> (Player,Hand)
+handleSetTrump ps p d (Just (C s v)) str = 
  if str == "order up" then (p, (H d s p StartOfTrick M.empty))  
- else ((nextP p), (StartOfHand d (Just (C s v)))) 
-handleSetTrump p d Nothing  str =
+ else ((nextP ps p), (StartOfHand d (Just (C s v)))) 
+handleSetTrump ps p d Nothing  str =
  let maybeSuit = readMaybe str :: Maybe Suit 
  in 
   case maybeSuit of
    (Just s) -> (p, (H d s p StartOfTrick M.empty))
    Nothing  -> if p == d then (p, (StartOfHand d Nothing)) 
-               else (nextP p, (StartOfHand d Nothing)) 
+               else (nextP ps p, (StartOfHand d Nothing)) 
      
        
 updateStateH :: State -> Hand -> State 
@@ -122,54 +125,103 @@ promptPlayer (P id n c) str =
 
 changeDealerS :: State -> State
 --change dealers only in not in 'StartOfHand'
+--also think I need to get a random card from shuffle for 'fu'
 changeDealerS (S p (G h gs)) = (S p (G (changeDealerH h) gs)) 
- where changeDealerH (H d t tc tr hs) = (H (nextP d) t tc tr hs) 
+ where changeDealerH (H d t tc tr hs) = (H (nextP p d) t tc tr hs) 
        changeDealerH (StartOfHand d fu) = StartOfHand d fu
  
-declareHandOver :: State -> IO State
---reset to StartOfHand?
-declareHandOver s = undefined
+declareHandOver :: Hand -> State -> State
+--reset to StartOfHand,update GameScore (using TrumpCaller and HandScore), increment dealer
+declareHandOver (H d _ tc _ hs) (S p (G _ gs)) = 
+ let (team,points) = calculateHandPoints tc hs 
+     gs' = updateGameScore team points gs
+ in (S p (G (StartOfHand (nextP p d) Nothing) gs'))
+
+updateGameScore :: Team -> Int -> GameScore -> GameScore
+updateGameScore t p gs = M.adjust (+p) t gs 
+
+calculateHandPoints :: Player -> HandScore -> (Team,Int)
+calculateHandPoints tc hs = 
+ let 
+  maxScore = maximum $ M.elems hs
+  winner = let max = M.keys $ M.filter (== maxScore) hs
+           in if length max == 0 then error "calcHandPts" else head max
+  eucher = S.notMember tc winner 
+ in if maxScore == 5 && eucher then (winner,4)
+ else if maxScore == 5 then (winner,2)
+ else (winner,1)
+
+mapMax :: Ord b => M.Map a b -> a
+mapMax xs = if length max == 0 then error "mapMax" else head max
+    where max = M.keys $ M.filter (== m) xs
+          m = maximum $ M.elems xs
 
 declareWinner :: State -> IO ()
-declareWinner = undefined
+declareWinner (S _ (G _ gs)) = 
+ print $ mapMax gs 
 
-playTrick :: State -> IO Trick 
+playTrick :: State -> IO State 
 playTrick s = 
- trickLoop (setupTrick s) >>=
- decideTrickWinner >>=
- return
+ trickLoop (getPlayersS s) (setupTrick s) >>=
+ decideTrickWinner (getTrumpS s) >>= 
+ \t -> return (updateStateT s t)
+
+updateStateT :: State -> Trick -> State
+--update players' cards,and dealer,and handScore,set trick to StartOfTrick
+updateStateT (S p (G h gs)) t = 
+ let h' = updateHandFromTrick p h t
+     p' = updatePlayersFromTrick p t
+ in (S p' (G h' gs))
+
+updatePlayersFromTrick :: Players -> Trick -> Players
+updatePlayersFromTrick ps (T _ _ _ cp) = 
+ fmap (\(P id n cs) -> 
+  (P id n (filter (\c -> 
+   (cp M.! (P id n cs)) /= c) cs))) ps 
+
+updateHandFromTrick :: Players -> Hand -> Trick -> Hand
+updateHandFromTrick ps (H d t tc tr hs) (T _ _ (Just w) _) = 
+ (H (nextP ps d) t tc StartOfTrick (updateHandScore w hs)) 
+ 
+updateHandScore :: Player -> HandScore -> HandScore 
+updateHandScore w hs = 
+ let team = if length flt == 0 then error "updateHandScr" else head flt
+      where flt = filter (\s -> S.member w s) $ M.keys hs
+ in M.adjust (+1) team hs 
 
 setupTrick :: State -> Trick 
 setupTrick s = 
- let p = nextP (getDealerS s)
+ let p = nextP (getPlayersS s) (getDealerS s)
  in (T p p Nothing M.empty)
 
-decideTrickWinner :: Trick -> IO Trick
-decideTrickWinner t = undefined
+decideTrickWinner :: Suit -> Trick -> IO Trick
+decideTrickWinner trump (T lp cp _ crds) = 
+ let p = fst $ L.maximumBy (trickOrdering trump (getSuit (crds M.! lp))) (M.toList crds)
+ in putStrLn ("trick winner: " ++ (getName p)) >> 
+    return (T lp cp (Just p) crds)
 
-trickLoop :: Trick -> IO Trick 
-trickLoop t = 
- if (getLeadPlayerT t) == (nextP (getCurrentPlayerT t))
- then return t 
- else
-  putStrLn "played so far: " >>
-  print (getCardsPlayedT t) >> 
-  promptPlayer (getCurrentPlayerT t) "play a card" >>= 
-  \str -> 
-   case (readMaybe str :: Maybe Card) of
-    Nothing  -> putStrLn "enter valid card" >> trickLoop t 
-    (Just c) -> if (playerHasCard (getCurrentPlayerT t) c)
-                then
-                 let oneTurnTrick = updateCardsPlayed t c 
-                 in trickLoop (advanceTrickPlayer oneTurnTrick) 
-                else 
-                 putStrLn "you don't have that card" >> trickLoop t
+trickLoop :: Players -> Trick -> IO Trick 
+trickLoop ps t = 
+ putStrLn "played so far: " >>
+ print (getCardsPlayedT t) >> 
+ promptPlayer (getCurrentPlayerT t) "play a card" >>= 
+ \str -> 
+  case (readMaybe str :: Maybe Card) of
+   Nothing  -> putStrLn "enter valid card" >> trickLoop ps t 
+   (Just c) -> if (playerHasCard (getCurrentPlayerT t) c)
+               then
+                let t' = updateCardsPlayed t c 
+                in if (getLeadPlayerT t') == (nextP ps (getCurrentPlayerT t'))
+                   then return t' 
+                   else trickLoop ps (advanceTrickPlayer ps t') 
+               else 
+                putStrLn "you don't have that card" >> trickLoop ps t
 
 updateCardsPlayed :: Trick -> Card -> Trick
 updateCardsPlayed (T lp cp w crds) c = (T lp cp w (M.insert cp c crds))  
 
-advanceTrickPlayer :: Trick -> Trick
-advanceTrickPlayer (T lp cp w crds) = (T lp (nextP cp) w crds)
+advanceTrickPlayer :: Players -> Trick -> Trick
+advanceTrickPlayer ps (T lp cp w crds) = (T lp (nextP ps cp) w crds)
 
 playerHasCard :: Player -> Card -> Bool
 playerHasCard (P _ _ cs) c = c `elem` cs
@@ -207,15 +259,15 @@ singlePlayerTurn s =
 -}
 --data State = S Player Player Player Player CurrentPlayer Turn CurrentTrick HandScore GameScore
 dealCards :: State -> IO State
-dealCards (S players game) = 
+dealCards (S players (G (StartOfHand d _) gs)) = 
  do cards <- shuffle allCards
     let (d1,rest1) = getFive cards
         (d2,rest2) = getFive rest1
         (d3,rest3) = getFive rest2
         (d4,rest4) = getFive rest3
-        trump      = getOne  rest4 
+        faceUp      = getOne  rest4 
         dealtPlayers = (fmap dealPlayer (F d1 d2 d3 d4)) <*> players 
-    return (S dealtPlayers game)
+    return (S dealtPlayers (G (StartOfHand d (Just faceUp)) gs))
     --maybe need to update game for first player and scores?
     --return (S dealtPlayers (firstPlayer dealtPlayers) 0 [] trump hs gs)
    where getFive:: [Card] -> ([Card],[Card])
@@ -260,20 +312,24 @@ removeCard c (P id n cs) = P id n (remove c cs)
        remove _ [] = []
        remove c (x:xs) = if x == c then xs else remove c xs
 
-ordering :: Suit -> Suit -> Card -> Card -> Ordering
-ordering trumpSuit leadSuit c1 c2 = 
+trickOrdering :: Suit -> Suit -> (Player,Card) -> (Player,Card) -> Ordering
+trickOrdering trumpSuit leadSuit (p1,c1) (p2,c2) = 
  let s1 = getSuit c1
      s2 = getSuit c2
      v1 = getVal c1
      v2 = getVal c2
  in 
-  if isTrump trumpSuit c1 && isTrump trumpSuit c2 then trumpOrdering trumpSuit c1 c1 
+  if isTrump trumpSuit c1 && isTrump trumpSuit c2 then trumpOrdering trumpSuit c1 c2 
   else if isTrump trumpSuit c1 then GT
   else if isTrump trumpSuit c2 then LT
   else leadSuitOrdering leadSuit c1 c2 
 
 leadSuitOrdering :: Suit -> Card -> Card -> Ordering
-leadSuitOrdering = undefined
+leadSuitOrdering leadSuit (C s1 v1) (C s2 v2) = 
+ if s1 == s2 then compare v1 v2
+ else if s1 == leadSuit then GT
+ else if s2 == leadSuit then LT
+ else compare v1 v2
 
 trumpOrdering :: Suit -> Card -> Card -> Ordering
 trumpOrdering trump (C s1 v1) (C s2 v2) = 
@@ -314,9 +370,6 @@ getLeadSuit (T lp _ _ cp) =
  case (M.lookup lp cp) of
   Nothing      -> error "lead player hasn't played yet"
   Just (C s v) -> s
-
-nextPlayer :: State -> Player
-nextPlayer s = playerOrder M.! currentPlayerS s  
 
 currentPlayerS :: State -> Player
 currentPlayerS s = currentPlayerT $ getTrickS s
@@ -364,8 +417,12 @@ getHandScoreH :: Hand -> HandScore
 getHandScoreH (H _ _ _ _ hs) = hs
 getHandScoreH _ = error "no hand yet"
 
-nextP :: Player -> Player
-nextP p = playerOrder M.! p
+nextP :: Players -> Player -> Player
+nextP (F p1 p2 p3 p4) p = 
+ if p == p1 then p2
+ else if p == p2 then p3
+ else if p == p3 then p4
+ else p1
 
 getCardsPlayedT :: Trick -> CardsPlayed
 getCardsPlayedT (T _ _ _ cp) = cp
@@ -376,4 +433,12 @@ getCurrentPlayerT (T _ cp _ _) = cp
 getLeadPlayerT:: Trick -> Player 
 getLeadPlayerT (T lp _ _ _) = lp
 
+getTrumpS :: State -> Suit
+getTrumpS s = getTrumpH $ getHandS s
 
+getTrumpH :: Hand -> Suit
+getTrumpH (H _ t _ _ _) = t
+getTrumpH _ = error "trump not decided yet"
+
+getPlayersS :: State -> Players
+getPlayersS (S ps _) = ps
