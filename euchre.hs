@@ -52,7 +52,7 @@ playHand :: State -> IO ()
 playHand s = 
  dealCards (changeDealerS s) >>=
  decideTrump >>= 
- playTricks 
+ (\s -> playTricks $ initializeHandScore s) 
 
 playTricks :: State -> IO () 
 playTricks s = 
@@ -113,7 +113,11 @@ handleSetTrump ps p d Nothing  str =
    Nothing  -> if p == d then (p, (StartOfHand d Nothing)) 
                else (nextP ps p, (StartOfHand d Nothing)) 
      
-       
+initializeHandScore :: State -> State       
+initializeHandScore (S ps (G h gs)) = (S ps (G (helper h gs) gs))
+ where helper :: Hand -> GameScore -> Hand
+       helper (H d t tc tr _) gs = (H d t tc tr (M.map (\_ -> 0) gs))  
+
 updateStateH :: State -> Hand -> State 
 updateStateH (S p (G _ gs)) h = S p (G h gs)  
 
@@ -185,8 +189,8 @@ updateHandFromTrick ps (H d t tc tr hs) (T _ _ (Just w) _) =
  
 updateHandScore :: Player -> HandScore -> HandScore 
 updateHandScore w hs = 
- let team = if length flt == 0 then error "updateHandScr" else head flt
-      where flt = filter (\s -> S.member w s) $ M.keys hs
+ let team = if length flt == 0 then error (show hs) else head flt
+      where flt = filter (\s -> S.member (getIdP w) (S.map getIdP s)) $ M.keys hs
  in M.adjust (+1) team hs 
 
 setupTrick :: State -> Trick 
@@ -442,3 +446,6 @@ getTrumpH _ = error "trump not decided yet"
 
 getPlayersS :: State -> Players
 getPlayersS (S ps _) = ps
+
+getIdP :: Player -> ID
+getIdP (P id _ _) = id
